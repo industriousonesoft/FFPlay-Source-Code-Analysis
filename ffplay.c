@@ -1639,9 +1639,9 @@ retry:
             Frame *vp, *lastvp;
 
             /* dequeue the picture */
-            // 上一次显示的帧
+            // 上一帧，注意：上一帧不一定是当前画面显示的帧，如果上一帧属于丢弃帧，那么显示画面则是更早之前的帧的数据
             lastvp = frame_queue_peek_last(&is->pictq);
-            // 此次待显示的帧
+            // 当前帧，即此次待显示的帧
             vp = frame_queue_peek(&is->pictq);
 
             // 待显示帧已过期，重新获取
@@ -1651,48 +1651,68 @@ retry:
                 goto retry;
             }
 
-            // 如果上一次显示的帧与当前帧不是出于同一个serial下，说明二者不是连续的帧
+            // 如果上一帧与当前帧不是出于同一个serial下，说明二者不是连续的帧
             // TODO: 为什么非连续帧需要校准帧刷新器
             if (lastvp->serial != vp->serial)
                 is->frame_timer = av_gettime_relative() / 1000000.0;
 
-            // TODO: 为什么暂停状态还刷新？
+            // 暂停则继续显示上一帧
             if (is->paused)
                 goto display;
 
             /* compute nominal last_duration */
-            // 计算上一帧视频在不考虑同步的情况下的显示时长
+            // 计算上一帧视频在不考虑同步的情况下的显示时长，称之为逻辑显示时长
             last_duration = vp_duration(is, lastvp, vp);
             // 计算上一帧视频同步后的显示时长
             delay = compute_target_delay(last_duration, is);
 
             // 当前系统时间
             time= av_gettime_relative()/1000000.0;
-            //
+            // is->frame_timer + delay表示当前帧的显示时刻，如果该值小于当前系统时间，说明当前帧播放的时刻还未到了，继续显示上一帧
             if (time < is->frame_timer + delay) {
+                // 更新距离下一次刷新视频的剩余时长
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
                 goto display;
             }
-
+            
+            // time >= is->frame_timer + delay： 当前帧显示的时刻已经到来或已落后于当前系统时间
+            // 更新当前帧的显示时刻
             is->frame_timer += delay;
+            // 当前帧的显示时刻远落后于当前系统时间，则校准当前帧的显示时刻为当前系统时间，即立即显示
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
                 is->frame_timer = time;
 
             SDL_LockMutex(is->pictq.mutex);
             if (!isnan(vp->pts))
+                // 更新视频时钟中的时间值、当前显示帧的pts值、和当前显示帧的序列号
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
             SDL_UnlockMutex(is->pictq.mutex);
 
+            // 如果视频帧队列中还有未显示的帧，则判断是否需要丢弃当前帧
             if (frame_queue_nb_remaining(&is->pictq) > 1) {
+                // 获取下一帧：即下一次待显示的帧
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
+                // 计算下一帧的逻辑显示时长
                 duration = vp_duration(is, vp, nextvp);
-                if(!is->step && (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) && time > is->frame_timer + duration){
+                // 判断是否满足丢帧条件
+                if(!is->step && // 1、非步进模式：不会自动显示视频，而是按s键一次就会播放下一帧图像
+                   // 2、启动丢帧机制；
+                   (framedrop>0 ||
+                   // TODO: 为什么在framedrop>0的前提下，还要做以下判断？
+                    (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) &&
+                   // 下一帧的播放时刻已到来，则丢弃当前帧
+                   time > is->frame_timer + duration)
+                {
+                    // 丢帧数累计
                     is->frame_drops_late++;
+                    // 上一帧出列，在下一次循环时当前帧则变为上一帧，但是画面显示的还是上一帧数据，因为当前帧属于丢弃帧
                     frame_queue_next(&is->pictq);
+                    // 重新进行视频的同步刷新
                     goto retry;
                 }
             }
 
+            // FIXME: 字幕流暂时不解析
             if (is->subtitle_st) {
                     while (frame_queue_nb_remaining(&is->subpq) > 0) {
                         sp = frame_queue_peek(&is->subpq);
@@ -1725,19 +1745,25 @@ retry:
                             break;
                         }
                     }
-            }
+            } // endif subtitle_st
 
+            // 删除上一帧，当前帧代替上一帧用以显示
             frame_queue_next(&is->pictq);
+            // 因为是显示新的视频帧，所以进行强制刷新
             is->force_refresh = 1;
 
+            // 步进模式且非暂停模式，则暂停显示等待按键
             if (is->step && !is->paused)
                 stream_toggle_pause(is);
         }
 display:
         /* display picture */
+        // 判断是否需要进行视频渲染：1、允许显示；2、强制刷新；3、当前显示模式是视频模式（区分音频波形图等）；4、存在待显示的视频帧
         if (!display_disable && is->force_refresh && is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown)
+            // 显示rindex指向的视频帧
             video_display(is);
     }
+    // 重置强制刷新标识，只有待显示帧更新时才强制刷新
     is->force_refresh = 0;
     if (show_status) {
         AVBPrint buf;
