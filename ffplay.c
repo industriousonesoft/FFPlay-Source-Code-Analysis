@@ -1672,6 +1672,7 @@ retry:
             if (time < is->frame_timer + delay) {
                 // 更新距离下一次刷新视频的剩余时长
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                // 继续显示上一个帧，由于是重复显示所有不会进行视频渲染
                 goto display;
             }
             
@@ -3322,12 +3323,12 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
             SDL_ShowCursor(0);
             cursor_hidden = 1;
         }
-        // 如果未到下一个刷新周期（注意，不是视频的真实帧率，而是用于音视频同步的刷线帧率），则待当前刷线周期结束再唤醒当前线程
+        // 如果未到下一个刷新周期（注意，不是视频的真实帧率，而是用于音视频同步的刷新帧率），则待当前刷线周期结束再唤醒当前线程
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
-        // 更新为新一轮的刷新周期
+        // 更新新一轮的刷新周期
         remaining_time = REFRESH_RATE;
-        // 运行显示视频
+        // 需要显示画面：音频波形图或视频画面
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
             // 视频同步刷新
             video_refresh(is, &remaining_time);
