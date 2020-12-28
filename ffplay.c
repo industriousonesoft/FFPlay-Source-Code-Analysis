@@ -118,12 +118,14 @@ const int program_birth_year = 2003;
 
 static unsigned sws_flags = SWS_BICUBIC;
 
+// 待解码包的结构，用于链表结构
 typedef struct MyAVPacketList {
     AVPacket pkt;
     struct MyAVPacketList *next;
     int serial;
 } MyAVPacketList;
 
+// 待解码包队列，用链表实现的FIFO
 typedef struct PacketQueue {
     MyAVPacketList *first_pkt, *last_pkt;
     int nb_packets;
@@ -140,6 +142,7 @@ typedef struct PacketQueue {
 #define SAMPLE_QUEUE_SIZE 9
 #define FRAME_QUEUE_SIZE FFMAX(SAMPLE_QUEUE_SIZE, FFMAX(VIDEO_PICTURE_QUEUE_SIZE, SUBPICTURE_QUEUE_SIZE))
 
+// 音频相关参数
 typedef struct AudioParams {
     int freq;
     int channels;
@@ -160,6 +163,7 @@ typedef struct Clock {
 } Clock;
 
 /* Common struct for handling all types of decoded data and allocated render buffers. */
+// 已解码帧结构
 typedef struct Frame {
     AVFrame *frame;
     AVSubtitle sub;
@@ -175,6 +179,7 @@ typedef struct Frame {
     int flip_v;
 } Frame;
 
+// 帧队列，数组实现的环形缓存区FIFO
 typedef struct FrameQueue {
     Frame queue[FRAME_QUEUE_SIZE];
     int rindex;
@@ -185,7 +190,7 @@ typedef struct FrameQueue {
     int rindex_shown;
     SDL_mutex *mutex;
     SDL_cond *cond;
-    PacketQueue *pktq;
+    PacketQueue *pktq; // 对应的packet队列
 } FrameQueue;
 
 enum {
@@ -603,9 +608,14 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
 
     for (;;) {
         AVPacket pkt;
-
+        
+        // 由于FFMpeg解码过程的异步的，其中解码后的帧如果未及时取出则会先缓存起来
+        // 因此，每次解码前需将上一次解码的帧取出后再开始新的解码操作
+        
+        // 待解码的包必须是解码的包队列中的一员，通过序列号serial进行判断
         if (d->queue->serial == d->pkt_serial) {
             do {
+                // 解码器对应的包序列已异常退出
                 if (d->queue->abort_request)
                     return -1;
 
@@ -642,6 +652,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 }
                 if (ret >= 0)
                     return 1;
+            // AVERROR(EAGAIN): 表示已经没有解码帧在缓存区，需要传入新的包进行解码
             } while (ret != AVERROR(EAGAIN));
         }
 
@@ -1849,6 +1860,7 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
     return 0;
 }
 
+// 解码视频
 static int get_video_frame(VideoState *is, AVFrame *frame)
 {
     int got_picture;
@@ -2206,6 +2218,7 @@ static int decoder_start(Decoder *d, int (*fn)(void *), const char *thread_name,
     return 0;
 }
 
+// 视频解码入口函数
 static int video_thread(void *arg)
 {
     VideoState *is = arg;
