@@ -653,16 +653,21 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                 if (ret >= 0)
                     return 1;
             // AVERROR(EAGAIN): 表示已经没有解码帧在缓存区，需要传入新的包进行解码
+            // There is a delay between sending and receiveing a frame, When receive function returns EAGAIN,
+            // you should call send function with the next encoded frame, the call receive again.
             } while (ret != AVERROR(EAGAIN));
         }
 
+        // 遍历packet队列获得下一个待解码的包
         do {
+            // 空队列
             if (d->queue->nb_packets == 0)
                 SDL_CondSignal(d->empty_queue_cond);
             if (d->packet_pending) {
                 av_packet_move_ref(&pkt, &d->pkt);
                 d->packet_pending = 0;
             } else {
+                // 取出一个指定序列号的包
                 if (packet_queue_get(d->queue, &pkt, 1, &d->pkt_serial) < 0)
                     return -1;
             }
@@ -671,12 +676,14 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             av_packet_unref(&pkt);
         } while (1);
 
+        // flush包，不需要解码用于标识flush操作
         if (pkt.data == flush_pkt.data) {
             avcodec_flush_buffers(d->avctx);
             d->finished = 0;
             d->next_pts = d->start_pts;
             d->next_pts_tb = d->start_pts_tb;
         } else {
+            // 字幕包
             if (d->avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {
                 int got_frame = 0;
                 ret = avcodec_decode_subtitle2(d->avctx, sub, &got_frame, &pkt);
@@ -689,6 +696,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
                     }
                     ret = got_frame ? 0 : (pkt.data ? AVERROR(EAGAIN) : AVERROR_EOF);
                 }
+            // 音视频包
             } else {
                 if (avcodec_send_packet(d->avctx, &pkt) == AVERROR(EAGAIN)) {
                     av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
@@ -1865,6 +1873,7 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
 {
     int got_picture;
 
+    // 视频解码
     if ((got_picture = decoder_decode_frame(&is->viddec, frame, NULL)) < 0)
         return -1;
 
@@ -1872,13 +1881,18 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
         double dpts = NAN;
 
         if (frame->pts != AV_NOPTS_VALUE)
+            // frame->pts是基于视频采样的时间戳（编解码中的时间戳），表示当前采样的进度，对应的time_base={1,90000}，表示采样一次需要的时间
+            // 解码后需要转换成以秒为单位的显示时间
             dpts = av_q2d(is->video_st->time_base) * frame->pts;
 
         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
 
+        // 1、启动丢帧机制；2、同步不是以视频时钟为参考时钟
         if (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
             if (frame->pts != AV_NOPTS_VALUE) {
+                // 当前帧的显示时间与参考时钟之间的差值
                 double diff = dpts - get_master_clock(is);
+                // 如果当前帧的显示时刻已慢于参考时钟，则丢弃当前帧
                 if (!isnan(diff) && fabs(diff) < AV_NOSYNC_THRESHOLD &&
                     diff - is->frame_last_filter_delay < 0 &&
                     is->viddec.pkt_serial == is->vidclk.serial &&
@@ -2138,6 +2152,7 @@ static int audio_thread(void *arg)
         return AVERROR(ENOMEM);
 
     do {
+        // 解码一帧音频数据
         if ((got_frame = decoder_decode_frame(&is->auddec, frame, NULL)) < 0)
             goto the_end;
 
@@ -2179,15 +2194,18 @@ static int audio_thread(void *arg)
             while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
                 tb = av_buffersink_get_time_base(is->out_audio_filter);
 #endif
+                // 获取一个可写入的frame
                 if (!(af = frame_queue_peek_writable(&is->sampq)))
                     goto the_end;
 
+                // frame->pts表示当前采样的次数，时间基为{1,采样率}，解码后需要转换成以秒为单位的显示时间
                 af->pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
                 af->pos = frame->pkt_pos;
                 af->serial = is->auddec.pkt_serial;
+                //
                 af->duration = av_q2d((AVRational){frame->nb_samples, frame->sample_rate});
 
-                av_frame_move_ref(af->frame, frame);
+                av_frame_move_ref(af->frame /*dst*/, frame /*src*/);
                 frame_queue_push(&is->sampq);
 
 #if CONFIG_AVFILTER
@@ -2243,6 +2261,7 @@ static int video_thread(void *arg)
         return AVERROR(ENOMEM);
 
     for (;;) {
+        // 解码一帧视频数据
         ret = get_video_frame(is, frame);
         if (ret < 0)
             goto the_end;
@@ -2305,7 +2324,9 @@ static int video_thread(void *arg)
                 is->frame_last_filter_delay = 0;
             tb = av_buffersink_get_time_base(filt_out);
 #endif
+            // 基于帧率计算当前帧的时长
             duration = (frame_rate.num && frame_rate.den ? av_q2d((AVRational){frame_rate.den, frame_rate.num}) : 0);
+            // 将以采样进度表示的时间戳转换成以秒为单位的时间戳
             pts = (frame->pts == AV_NOPTS_VALUE) ? NAN : frame->pts * av_q2d(tb);
             ret = queue_picture(is, frame, pts, duration, frame->pkt_pos, is->viddec.pkt_serial);
             av_frame_unref(frame);
